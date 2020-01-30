@@ -1,18 +1,8 @@
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-#include <stdexcept>
-#include <strings.h>
-#include <stropts.h>
-#include <string.h>
-#include <sys/select.h>
-#include <stdio.h>
-#include <stdexcept>
-
 #include "TCPClient.h"
-
+#include <thread>
+#include <ctime>
+#include <regex>
+#include "exceptions.h"
 
 /**********************************************************************************************
  * TCPClient (constructor) - Creates a Stdin file descriptor to simplify handling of user input. 
@@ -39,9 +29,44 @@ TCPClient::~TCPClient() {
  **********************************************************************************************/
 
 void TCPClient::connectTo(const char *ip_addr, unsigned short port) {
-   if (!_sockfd.connectTo(ip_addr, port))
-      throw socket_error("TCP Connection failed!");
+	// create socket
+	int sockfd = socket(AF_INET, SOCK_STREAM, 0);
 
+	if (sockfd == 0) 
+		throw socket_error("Failed to make socket!");
+
+	// BELOW IS FOR TESTING PURPOSES ONLY!	
+	// explicitly set client ip address
+	if (clientTestMode) {
+		struct sockaddr_in myAddr;
+		myAddr.sin_family = AF_INET;
+		myAddr.sin_addr.s_addr = inet_addr("127.0.0.6");
+	
+		if (bind(sockfd, (struct sockaddr*) &myAddr, sizeof(struct sockaddr_in)) == 0) 
+			std::cout << "Bound client" << std::endl;
+		else
+			std::cout << "Failed to bind client" << std::endl;
+
+	}
+
+	// connect to server
+	this->server.sin_addr.s_addr = inet_addr(ip_addr);
+	this->server.sin_family = AF_INET;
+	this->server.sin_port = htons(port);
+	int connection = connect(sockfd, (struct sockaddr*)&this->server, sizeof(this->server));
+
+	if (connection < 0) 
+		throw socket_error("Failed to connect to server!");
+	
+	this->sockfd = sockfd;
+
+	// start receiving thread
+	std::thread receivingThread(&TCPClient::receivingThread, this);
+	receivingThread.detach(); // make thread a daemon
+
+	// start sending thread
+	std::thread sendingThread(&TCPClient::sendingThread, this);
+	sendingThread.detach(); // make thread a daemon
 }
 
 /**********************************************************************************************
@@ -53,52 +78,92 @@ void TCPClient::connectTo(const char *ip_addr, unsigned short port) {
  **********************************************************************************************/
 
 void TCPClient::handleConnection() {
-   
-   bool connected = true;
-   int sin_bufsize = 0;
-   ssize_t rsize = 0;
 
-   timespec sleeptime;
-   sleeptime.tv_sec = 0;
-   sleeptime.tv_nsec = 1000000;
+	while (!connClosed && !connectionBroke) {
+		// check if we got any new messages from the server
+		this->mtx1.lock();
+		if(!this->receivedMessages.empty()) {
+			auto message = this->receivedMessages.front();
+			
+			if (sanitizeUserInput(message).compare("") != 0) // only display messages that have data
+				std::cout << std::endl << message;
 
+			this->receivedMessages.pop();
+		}
+		this->mtx1.unlock();
+	}
 
-   // Loop while we have a valid connection
-   while (connected) {
+	// check for broken connection
+	if (this->connectionBroke) 
+		throw std::runtime_error("Failed to receive heartbeat from server for 8 seconds!");
+}
 
-      // If the connection was closed, exit
-      if (!_sockfd.isOpen())
-         break;
+bool TCPClient::sendData(std::string data) {
+	if (send(this->sockfd, data.c_str(), data.length(), 0) < 0) {
+		std::cout << "Failed to send.\n";
+		return false;
+	}
+	return true;
+}
 
-      // Send any user input
-      if ((sin_bufsize = readStdin()) > 0)  {
-         std::string subbuf = _in_buf.substr(0, sin_bufsize+1);
-         _sockfd.writeFD(subbuf);
-         _in_buf.erase(0, sin_bufsize+1);
-      }
+std::string TCPClient::receiveData() {
+	char buffer[2048] = "";
 
-      // Read any data from the socket and display to the screen and handle errors
-      std::string buf;
-      if (_sockfd.hasData()) {
-         if ((rsize = _sockfd.readFD(buf)) == -1) {
-            throw std::runtime_error("Read on client socket failed.");
-         }
+	if (recv(sockfd, buffer, sizeof(buffer), 0) < 0) {
+		std::cout << "Failed to receive.\n";
+	}
 
-         // Select indicates data, but 0 bytes...usually because it's disconnected
-         if (rsize == 0) {
-            closeConn();
-            break;
-         }
+	std::string response(buffer);
 
-         // Display to the screen
-         if (rsize > 0) {
-            printf("%s", buf.c_str());
-            fflush(stdout);
-         }
-      }
+	return response;
+}
 
-      nanosleep(&sleeptime, NULL);
-   }
+void TCPClient::receivingThread() {
+	while (!connClosed && !connectionBroke) {
+		auto response = receiveData();
+
+		// check for heartbeat from server
+		std::chrono::system_clock::time_point now = std::chrono::system_clock::now(); // get current time
+		if (response.compare("HEARTBEAT\n") == 0) {
+			this->lastTimeHeartBeatReceived = now;
+			continue; // don't push HB's to end user
+		} else { // check if it has been > 8 seconds since last hb
+			if (now - this->lastTimeHeartBeatReceived > std::chrono::seconds(8))
+				this->connectionBroke = true; // signal we have a broken connection
+		}
+
+		this->mtx1.lock();
+		this->receivedMessages.push(response);
+		this->mtx1.unlock();
+	}
+}
+
+void TCPClient::sendingThread() {
+	while (!connClosed && !connectionBroke) {
+		std::string clientMessage;
+		std::cin >> clientMessage;
+
+		auto sent = sendData(clientMessage);
+
+		if (sanitizeUserInput(clientMessage).compare("exit") == 0 || !sent) {
+			this->connClosed = true;
+			break;
+		}
+	}
+}
+
+std::string TCPClient::sanitizeUserInput(const std::string& s) {
+	// remove leading/trailing white spaces from user input
+	// influence from https://www.techiedelight.com/trim-string-cpp-remove-leading-trailing-spaces/
+	std::string leftTrimmed = std::regex_replace(s, std::regex("^\\s+"), std::string(""));
+	std::string leftAndRightTrimmed = std::regex_replace(leftTrimmed, std::regex("\\s+$"), std::string(""));
+	
+	// convert string to lowercase
+	// influence from https://stackoverflow.com/questions/313970/how-to-convert-stdstring-to-lower-case
+	std::transform(leftAndRightTrimmed.begin(), leftAndRightTrimmed.end(), leftAndRightTrimmed.begin(),
+    [](unsigned char c){ return std::tolower(c); });
+
+	return leftAndRightTrimmed;
 }
 
 /**********************************************************************************************
@@ -106,41 +171,8 @@ void TCPClient::handleConnection() {
  *
  *    Throws: socket_error for recoverable errors, runtime_error for unrecoverable types
  **********************************************************************************************/
-
 void TCPClient::closeConn() {
-    _sockfd.closeFD(); 
-}
-
-/******************************************************************************
- * readStdin - takes input from the user and stores it in a buffer. We only send
- *             the buffer after a carriage return
- *
- *    Return: 0 if not ready to send, buffer length if ready
- *****************************************************************************/
-int TCPClient::readStdin() {
-
-   if (!_stdin.hasData()) {
-      return 0;
-   }
-
-   // More input, get it and concat it to the buffer
-   std::string readbuf;
-   int amt_read;
-   if ((amt_read = _stdin.readFD(readbuf)) < 0) {
-      throw std::runtime_error("Read on stdin failed unexpectedly.");
-   }
-   
-   _in_buf += readbuf;
-
-   // Did we either fill up the buffer or is there a newline/carriage return?
-   int sendto;
-   if (_in_buf.length() >= stdin_bufsize)
-      sendto = _in_buf.length();
-   else if ((sendto = _in_buf.find("\n")) == std::string::npos) {
-      return 0;
-   }
-   
-   return sendto;
+	close(sockfd);
 }
 
 
