@@ -367,7 +367,7 @@ void PasswdMgr::hashArgon2(std::vector<uint8_t> &ret_hash, std::vector<uint8_t> 
 		for (unsigned int i=0; i < saltlen; i++)
 			salt[i] = static_cast<uint8_t>(in_salt.at(i));
 	} else { // generate a salt for user
-		std::string str("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*()-=_+{}|:<>?"); // random letters/symbols that the salt could compose of
+		std::string str("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"); // random letters/symbols that the salt could compose of
 		std::random_device rd;
 		std::mt19937 generator(rd());
 
